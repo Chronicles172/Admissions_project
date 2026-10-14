@@ -1,0 +1,5 @@
+{
+  "gender": ["M", "F"],
+  "education": ["WASSCE/NECO", "ENGLISH IB", "FRENCH IB", "IGCSE", "AMERICAN DIPLOMA", "CANADIAN DIPLOMA", "A-LEVELS" ],
+  "program": ["BSc Mechanical Engineering", "BSc Electronics & Communication Engineering", "BSc Computer Engineering", "BSc Electrical & Electronics Engineering", "BSc Industrial & Systems Engineering", "BSc Robotics Engineering", "BSc Biomedical Engineering", "BBA Accounting", "BBA Banking & Finance", "BBA Human Resource Management", "BBA Marketing", "BBA Entrepreneurship", "BSc Information Technology", "BSc Computer Science", "BSc Artificial Intelligence"]
+}
