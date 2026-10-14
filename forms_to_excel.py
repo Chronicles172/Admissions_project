@@ -25,6 +25,10 @@ How it works:
     validation (or from dropdowns.json), so the script only writes values your dropdown accepts.
     Close matches are accepted, e.g. a program written without "BSc"/"BBA".
   * Cells it is unsure about are highlighted yellow with a comment naming the photo to check.
+  * Emails and phone numbers get extra care: each is read a second time from a larger image,
+    and the two readings are compared. Disagreements, badly formed emails and phone numbers
+    with the wrong digit count are flagged yellow, with both readings in the comment.
+    (Use --no-double-check to skip the second reading and save cost.)
   * STATUS, REMARKS and COUNSELLOR are never touched.
   * A small log (<output>.log.csv) records which photos went into which row.
 """
@@ -48,6 +52,7 @@ from PIL import Image, ImageOps
 MODEL = "claude-sonnet-5-5"  # change if your account uses a different model
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_SIDE = 1800
+VERIFY_SIDE = 2600  # the second, closer reading of emails and phone numbers uses a larger image
 
 # JSON key returned by the model -> internal column key
 STUDENT_MAP = {
@@ -191,24 +196,23 @@ Return ONLY a JSON object (no markdown fences) with: form_type, uncertain_fields
 names), and every key listed for that form type."""
 
 
-def load_image_b64(path, rotate):
+def load_image_b64(path, rotate, max_side=None):
     img = ImageOps.exif_transpose(Image.open(path))
     if rotate:
         img = img.rotate(rotate, expand=True)  # counter-clockwise degrees
     img = img.convert("RGB")
-    img.thumbnail((MAX_SIDE, MAX_SIDE))
+    img.thumbnail((max_side or MAX_SIDE, max_side or MAX_SIDE))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return base64.standard_b64encode(buf.getvalue()).decode()
 
 
-def extract(client, path, rotate, prompt):
-    image_b64 = load_image_b64(path, rotate)
+def ask_json(client, image_b64, prompt, max_tokens=1000):
     resp, text = None, ""
     for _attempt in range(2):  # one automatic retry if the reply is not readable data
         resp = client.messages.create(
             model=MODEL,
-            max_tokens=1000,
+            max_tokens=max_tokens,
             messages=[{
                 "role": "user",
                 "content": [
@@ -227,6 +231,68 @@ def extract(client, path, rotate, prompt):
                 pass
     raise ValueError(f"no readable data in the reply (stop reason: {resp.stop_reason}; "
                      f"reply began: {text[:100]!r})")
+
+
+def extract(client, path, rotate, prompt):
+    return ask_json(client, load_image_b64(path, rotate), prompt)
+
+
+VERIFY_PROMPT = """This is a photo of a hand-filled paper enquiry form (it may be sideways).
+Read ONLY the email address and the phone number on this slip, slowly, character by character.
+Handwriting is often unclear, so be careful with look-alikes: 0/O, 1/l/I, 5/S, 2/Z, 8/B, 6/b,
+u/v, rn/m, a/o, and with the @ sign and dots in emails.
+Return ONLY a JSON object (no fences) with:
+  "email": the email address in lowercase, or "" if blank,
+  "contact": the phone number, digits only, WITHOUT a leading 0 and WITHOUT any country code,
+             or "" if blank
+Copy exactly what is written; do not correct or guess."""
+
+
+def verify_contact(client, path, rotate):
+    """Second, independent reading of just the email and phone, from a larger image."""
+    return ask_json(client, load_image_b64(path, rotate, VERIFY_SIDE), VERIFY_PROMPT, max_tokens=300)
+
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)+$")
+
+
+def check_email(value):
+    return bool(EMAIL_RE.match(str(value).strip()))
+
+
+def check_phone(value, dial_code):
+    """Ghana (233) numbers have 9 digits once the leading 0 is dropped; otherwise accept 7-12."""
+    digits = re.sub(r"\D", "", str(value))
+    digits = digits[1:] if digits.startswith("0") else digits
+    return len(digits) == 9 if str(dial_code) == "233" else 7 <= len(digits) <= 12
+
+
+def reconcile_contacts(data, second, dial_code):
+    """Compare the two readings of email/phone, validate their format, and flag problems."""
+    notes = data.setdefault("_notes", {})
+    unc = set(data.get("uncertain_fields", []))
+    written_code = re.sub(r"\D", "", str(data.get("dial_code", "") or ""))
+    code = written_code or re.sub(r"\D", "", str(dial_code or ""))
+    checks = {
+        "email": (lambda x: x.strip().lower(), check_email),
+        "contact": (lambda x: re.sub(r"\D", "", x).lstrip("0"), lambda x: check_phone(x, code)),
+    }
+    for key, (norm_fn, is_valid) in checks.items():
+        a = str(data.get(key, "") or "").strip()
+        b = str(second.get(key, "") or "").strip() if second else None
+        if b is not None and norm_fn(a) != norm_fn(b):
+            if a and b and is_valid(b) and not is_valid(a):
+                data[key] = b  # keep the reading that has a valid format
+            unc.add(key)
+            notes[key] = f"Two readings disagree: '{a}' vs '{b}'."
+        final = str(data.get(key, "") or "").strip()
+        if final and not is_valid(final):
+            unc.add(key)
+            kind = "Email format looks wrong." if key == "email" else \
+                   "Phone number has the wrong number of digits."
+            notes[key] = (notes[key] + " " if key in notes else "") + kind
+    data["uncertain_fields"] = sorted(unc)
+    return data
 
 
 # --------------------------------------------------------------------------- helpers
@@ -379,6 +445,8 @@ def main():
     ap.add_argument("--options-file", type=Path,
                     help="JSON file with dropdown values, used when the sheet has no dropdowns "
                          "(default: dropdowns.json in the current folder, if it exists)")
+    ap.add_argument("--no-double-check", action="store_true",
+                    help="skip the second reading of emails/phones (cheaper, less safe)")
     args = ap.parse_args()
 
     out = args.workbook if args.in_place else (
@@ -417,8 +485,17 @@ def main():
     items = []
     for p in photos:
         try:
-            items.append((p.name, extract(client, p, args.rotate, prompt)))
-            print(f"read  {p.name}")
+            data = extract(client, p, args.rotate, prompt)
+            second = None
+            if not args.no_double_check and data.get("form_type") in ("student", "parent"):
+                try:
+                    second = verify_contact(client, p, args.rotate)
+                except Exception as e:  # a failed second look should not lose the photo
+                    print(f"WARN  {p.name}: second reading of email/phone failed ({e})")
+            reconcile_contacts(data, second, args.dial_code)
+            items.append((p.name, data))
+            flagged = [k for k in data.get("_notes", {})]
+            print(f"read  {p.name}" + (f"  (check: {', '.join(flagged)})" if flagged else ""))
         except Exception as e:  # keep going if one photo fails
             print(f"FAIL  {p.name}: {e}")
 
@@ -460,7 +537,9 @@ def main():
                                            f"photo: {fname})", "forms_to_excel")
                 if key in uncertain:
                     cell.fill = YELLOW
-                    cell.comment = Comment(f"Check against photo: {fname}", "forms_to_excel")
+                    note = data.get("_notes", {}).get(key)
+                    cell.comment = Comment((note + " " if note else "") + f"Check against photo: {fname}",
+                                           "forms_to_excel")
         if rec["student"] is None:
             ws.cell(r, cols["student_name"]).comment = Comment("Parent slip with no student slip", "forms_to_excel")
             ws.cell(r, cols["student_name"]).fill = YELLOW
